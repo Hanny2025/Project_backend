@@ -605,7 +605,196 @@ app.get("/history/debug", async (req, res) => {
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
+app.post("/staff/add_room", async (req, res) => {
+  const { Room_name, image_url, price_per_day, status } = req.body;
+  try {
+    if (!Room_name || !price_per_day) {
+      return res.status(400).json({ message: "Room name and price are required" });
+    }
+    const [existingRoom] = await pool.query(
+      "SELECT Room_name FROM room WHERE Room_name = ?",
+      [Room_name]
+    );
+    if (existingRoom.length > 0) {
+      return res.status(400).json({ message: "Room name already exists" });
+    }
+    const [result] = await pool.query(
+      "INSERT INTO room (Room_name, image_url, price_per_day, status) VALUES (?, ?, ?, ?)",
+      [Room_name, image_url, price_per_day, status || 'available']
+    );
+    res.status(201).json({ 
+      message: "Room added successfully", 
+      room_id: result.insertId 
+    });
+  } catch (error) {
+    console.error("Error adding room:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
 
+app.post("/staff/edit_room", async (req, res) => {
+  const { Room_id, Room_name, image_url, price_per_day, status } = req.body;
+  
+  try {
+  
+    if (!Room_id) {
+      return res.status(400).json({ message: "Room ID is required" });
+    }
+
+    
+    const [existingRoom] = await pool.query(
+      "SELECT Room_id FROM room WHERE Room_id = ?",
+      [Room_id]
+    );
+
+    if (existingRoom.length === 0) {
+      return res.status(404).json({ message: "Room not found" });
+    }
+
+   
+    if (Room_name) {
+      const [duplicateRoom] = await pool.query(
+        "SELECT Room_id FROM room WHERE Room_name = ? AND Room_id != ?",
+        [Room_name, Room_id]
+      );
+
+      if (duplicateRoom.length > 0) {
+        return res.status(400).json({ message: "Room name already exists" });
+      }
+    }
+
+   
+    let updateFields = [];
+    let updateValues = [];
+
+    if (Room_name) {
+      updateFields.push("Room_name = ?");
+      updateValues.push(Room_name);
+    }
+    if (image_url) {
+      updateFields.push("image_url = ?");
+      updateValues.push(image_url);
+    }
+    if (price_per_day) {
+      updateFields.push("price_per_day = ?");
+      updateValues.push(price_per_day);
+    }
+    if (status) {
+      updateFields.push("status = ?");
+      updateValues.push(status);
+    }
+
+   
+    if (updateFields.length > 0) {
+      updateValues.push(Room_id); 
+
+      await pool.query(
+        `UPDATE room SET ${updateFields.join(", ")} WHERE Room_id = ?`,
+        updateValues
+      );
+
+      res.status(200).json({ 
+        message: "Room updated successfully" 
+      });
+    } else {
+      res.status(400).json({ 
+        message: "No fields to update" 
+      });
+    }
+    
+  } catch (error) {
+    console.error("Error updating room:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+app.get("/staff/history", async (req, res) => {
+  try {
+    // ดึงประวัติทั้งหมดจากตาราง history
+    const [history] = await pool.query(`
+      SELECT 
+        h.Log_id,
+        h.booking_id,
+        h.user_id,
+        h.action,
+        h.action_time,
+        u.username,
+        u.role,
+        b.Room_id,
+        r.Room_name,
+        b.booking_date,
+        s.Start_time,
+        s.End_time
+      FROM history h
+      LEFT JOIN users u ON h.user_id = u.User_id
+      LEFT JOIN bookings b ON h.booking_id = b.Booking_id
+      LEFT JOIN room r ON b.Room_id = r.Room_id
+      LEFT JOIN time_slots s ON b.Slot_id = s.Slot_id
+      ORDER BY h.action_time DESC
+    `);
+
+    res.status(200).json({
+      message: "History retrieved successfully",
+      data: history
+    });
+
+  } catch (error) {
+    console.error("Error fetching history:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+app.get("/staff/dashboard", async (req, res) => {
+  try {
+ 
+    const [totalBookings] = await pool.query(`
+      SELECT COUNT(*) as total FROM bookings
+    `);
+
+   
+    const [bookingStatus] = await pool.query(`
+      SELECT status, COUNT(*) as count 
+      FROM bookings 
+      GROUP BY status
+    `);
+
+   
+    const [userRoles] = await pool.query(`
+      SELECT role, COUNT(*) as count 
+      FROM users 
+      GROUP BY role
+    `);
+
+   
+    const [recentHistory] = await pool.query(`
+      SELECT 
+        h.action,
+        h.action_time,
+        u.username,
+        u.role,
+        r.Room_name
+      FROM history h
+      LEFT JOIN users u ON h.user_id = u.User_id
+      LEFT JOIN bookings b ON h.booking_id = b.Booking_id
+      LEFT JOIN room r ON b.Room_id = r.Room_id
+      ORDER BY h.action_time DESC 
+      LIMIT 10
+    `);
+
+    res.status(200).json({
+      message: "Dashboard data retrieved successfully",
+      data: {
+        totalBookings: totalBookings[0].total,
+        bookingStatus,
+        userRoles,
+        recentHistory
+      }
+    });
+
+  } catch (error) {
+    console.error("Error fetching dashboard data:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
 // =========================
 // ✅ API ดึงประวัติ (History) - (สำหรับ Lecturer/Admin)
 // =========================
@@ -680,6 +869,41 @@ app.get("/get_user", async (req, res) => {
   } catch (error) {
     console.error(" Database error:", error);
     res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+// GET /staff/rooms
+app.get("/staff/rooms", async (req, res) => {
+  try {
+    const [rooms] = await pool.query(`
+      SELECT 
+        Room_id,
+        Room_name,
+        image_url,
+        price_per_day,
+        status
+      FROM room 
+      ORDER BY Room_id DESC
+    `);
+
+    // ตรวจสอบว่ามีข้อมูลหรือไม่
+    if (rooms.length === 0) {
+      return res.status(404).json({ 
+        message: "No rooms found",
+        data: []
+      });
+    }
+
+    res.status(200).json({
+      message: "Rooms retrieved successfully",
+      data: rooms
+    });
+
+  } catch (error) {
+    console.error("Error fetching rooms:", error);
+    res.status(500).json({ 
+      message: "Internal Server Error",
+      error: error.message 
+    });
   }
 });
 
