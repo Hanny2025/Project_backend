@@ -2,11 +2,76 @@ const express = require("express");
 const cors = require("cors");
 const pool = require("./db");
 const bcrypt = require("bcrypt");
-
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const app = express();
 const port = 3000;
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadPath = path.join(__dirname, 'uploads', 'rooms');
+    
+    // ⭐️ สร้างโฟลเดอร์ถ้ายังไม่มี
+    if (!fs.existsSync(uploadPath)) {
+      fs.mkdirSync(uploadPath, { recursive: true });
+      console.log('📁 Created upload directory:', uploadPath);
+    }
+    
+    console.log('📂 Saving file to:', uploadPath);
+    cb(null, uploadPath);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const fileName = 'room-' + uniqueSuffix + path.extname(file.originalname);
+    console.log('📄 File will be saved as:', fileName);
+    cb(null, fileName);
+  }
+});
+
+
+const upload = multer({ 
+  storage: storage,
+  fileFilter: (req, file, cb) => {
+    console.log('📁 File details:', {
+      originalname: file.originalname,
+      mimetype: file.mimetype,
+      size: file.size
+    });
+
+    // ⭐️ อนุญาต application/octet-stream ด้วย (มักมาจาก mobile)
+    const allowedMimes = [
+      'image/jpeg',
+      'image/jpg', 
+      'image/png',
+      'image/gif',
+      'image/webp',
+      'image/bmp',
+      'image/svg+xml',
+      'application/octet-stream' // ⭐️ เพิ่มนี้
+    ];
+
+    // ⭐️ ตรวจสอบจาก extension ด้วย
+    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
+    const fileExtension = path.extname(file.originalname).toLowerCase();
+
+    if (allowedMimes.includes(file.mimetype) || 
+        allowedExtensions.includes(fileExtension)) {
+      cb(null, true);
+    } else {
+      console.log('❌ Rejected file:', {
+        mimetype: file.mimetype,
+        extension: fileExtension,
+        originalname: file.originalname
+      });
+      cb(new Error(`File type ${file.mimetype} (${fileExtension}) is not allowed. Only image files are allowed!`), false);
+    }
+  },
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
 
 app.get("/", (req, res) => {
   res.send("Hello from Express!");
@@ -104,6 +169,7 @@ app.get("/rooms-with-status", async (req, res) => {
         r.Room_id,
         r.Room_name,
         r.image_url,
+        r.price_per_day,
         r.status AS Room_status, 
         ts.Slot_id,
         ts.Label AS Slot_label,
@@ -116,13 +182,11 @@ app.get("/rooms-with-status", async (req, res) => {
       LEFT JOIN bookings b 
         ON r.Room_id = b.Room_id 
         AND ts.Slot_id = b.Slot_id 
-        AND b.booking_date = ?  -- ✅ ใช้ date ที่ส่งมาจาก query
-        AND b.status IN ('pending', 'approved')  -- ✅ เช็คเฉพาะการจองที่ยังคงใช้งาน
-      
+        AND b.booking_date = ?
+        AND b.status IN ('pending', 'approved')
       ORDER BY r.Room_id, ts.Slot_id;
     `;
 
-    // ✅ ส่ง [date] เข้าไปใน query เพื่อแทนที่ ?
     const [rows] = await pool.query(sql, [date]);
 
     if (rows.length === 0) {
@@ -133,10 +197,22 @@ app.get("/rooms-with-status", async (req, res) => {
 
     for (const row of rows) {
       if (!roomsMap.has(row.Room_id)) {
+        // ⭐️ แก้ไข: สร้าง full URL สำหรับ image_url
+        let imageUrl = row.image_url;
+        console.log('🖼️ Original image_url:', imageUrl);
+
+        if (imageUrl && !imageUrl.startsWith('http')) {
+          // ใช้ IP address โดยตรง
+          imageUrl = `http://26.122.43.191:3000${imageUrl.startsWith('/') ? '' : '/'}${imageUrl}`;
+        }
+
+        console.log('🔗 Converted image_url:', imageUrl);
+
         roomsMap.set(row.Room_id, {
           Room_id: row.Room_id,
           Room_name: row.Room_name,
-          image_url: row.image_url,
+          image_url: imageUrl, // ⭐️ ส่ง full URL
+          price_per_day: row.price_per_day,
           Room_status: row.Room_status,
           slots: [],
         });
@@ -149,10 +225,56 @@ app.get("/rooms-with-status", async (req, res) => {
       });
     }
 
-    res.json(Array.from(roomsMap.values()));
+    const result = Array.from(roomsMap.values());
+    res.json(result);
+
   } catch (error) {
     console.error("Error fetching rooms with status:", error);
     res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+app.get("/check-images", (req, res) => {
+  const uploadsPath = path.join(__dirname, 'uploads', 'rooms');
+  
+  try {
+    // ตรวจสอบว่าโฟลเดอร์มีอยู่หรือไม่
+    if (!fs.existsSync(uploadsPath)) {
+      console.log('❌ uploads/rooms folder does not exist');
+      return res.json({ 
+        exists: false, 
+        message: 'uploads/rooms folder does not exist',
+        currentDir: __dirname
+      });
+    }
+
+    // อ่านไฟล์ทั้งหมดในโฟลเดอร์
+    const files = fs.readdirSync(uploadsPath);
+    console.log('📁 Files in uploads/rooms:', files);
+    
+    // ตรวจสอบไฟล์ที่ต้องการ
+    const targetFile = 'room-1763396665467-336364186.png';
+    const fileExists = files.includes(targetFile);
+    
+    console.log(`🔍 Looking for: ${targetFile}`);
+    console.log(`✅ File exists: ${fileExists}`);
+    
+    if (fileExists) {
+      const filePath = path.join(uploadsPath, targetFile);
+      const fileStats = fs.statSync(filePath);
+      console.log(`📊 File size: ${fileStats.size} bytes`);
+    }
+
+    res.json({
+      folderExists: true,
+      targetFile: targetFile,
+      fileExists: fileExists,
+      allFiles: files,
+      uploadsPath: uploadsPath
+    });
+
+  } catch (error) {
+    console.error('Error checking images:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -337,7 +459,60 @@ app.patch("/bookings/:booking_id/status", async (req, res) => {
     connection.release();
   }
 });
+app.delete("/staff/delete_room", async (req, res) => {
+  const { Room_id } = req.body;
 
+  // 1. ตรวจสอบว่าส่ง Room_id มาหรือไม่
+  if (!Room_id) {
+    return res.status(400).json({
+      success: false,
+      message: "Room ID is required",
+    });
+  }
+
+  try {
+    // 2. ตรวจสอบว่าห้องนี้มีอยู่จริงหรือไม่
+    const [existingRoom] = await pool.query(
+      "SELECT Room_id FROM room WHERE Room_id = ?",
+      [Room_id]
+    );
+
+    if (existingRoom.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Room not found",
+      });
+    }
+
+    // 3. ทำ Soft Delete: อัปเดต 'status' เป็น 'Disabled'
+    // (เราไม่ใช้ DELETE จริงๆ เพราะข้อมูลนี้ผูกกับตาราง bookings และ history)
+    const updateQuery = "UPDATE room SET status = 'Disabled' WHERE Room_id = ?";
+    
+    const [result] = await pool.query(updateQuery, [Room_id]);
+
+    if (result.affectedRows === 0) {
+      // เกิดข้อผิดพลาดบางอย่าง หรือ status เป็น 'Disabled' อยู่แล้ว
+      return res.status(500).json({
+        success: false,
+        message: "Failed to disable room or status was already Disabled",
+      });
+    }
+
+    // 4. ส่งข้อความสำเร็จกลับไป
+    return res.status(200).json({
+      success: true,
+      message: "Room successfully disabled (soft deleted)",
+    });
+
+  } catch (error) {
+    // 5. จัดการ Error
+    console.error("Error during soft delete:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
 // =========================
 // ✅ API ยกเลิกการจอง (Cancel Booking)
 // =========================
@@ -592,6 +767,25 @@ app.get("/history", async (req, res) => {
     });
   }
 });
+console.log('Current directory:', __dirname);
+
+// ตั้งค่า static file serving ที่ถูกต้อง
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// หรือใช้แบบนี้
+app.use(express.static('uploads')); // สำหรับโฟลเดอร์ uploads ใน root
+
+// หรือแบบละเอียด
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+// ทดสอบ route
+app.get('/test-static', (req, res) => {
+  res.json({
+    currentDir: __dirname,
+    currentWorkingDir: process.cwd(),
+    uploadsPath: path.join(__dirname, 'uploads')
+  });
+});
 
 // Small debug endpoint to quickly inspect recent history rows (useful during dev)
 app.get("/history/debug", async (req, res) => {
@@ -605,108 +799,101 @@ app.get("/history/debug", async (req, res) => {
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
-app.post("/staff/add_room", async (req, res) => {
-  const { Room_name, image_url, price_per_day, status } = req.body;
+app.post("/staff/upload-room-image", upload.single('image'), async (req, res) => {
   try {
-    if (!Room_name || !price_per_day) {
-      return res.status(400).json({ message: "Room name and price are required" });
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: "No image file uploaded"
+      });
     }
+
+    // ส่ง full URL ที่ถูกต้อง
+    const imageUrl = `http://26.122.43.191:3000/uploads/rooms/${req.file.filename}`;
+
+    res.json({
+      success: true,
+      message: "Image uploaded successfully",
+      image_url: imageUrl,  // ใช้ full URL
+      filename: req.file.filename
+    });
+
+  } catch (error) {
+    console.error("Error uploading image:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error uploading image"
+    });
+  }
+});
+
+// ⭐️ ต้องใช้ 'room_image' (เอกพจน์) เพราะใช้ upload.single()
+app.post("/staff/add_room", upload.single('room_image'), async (req, res) => {
+  console.log('📨 Received POST to /staff/add_room');
+  console.log('📝 Body:', req.body);
+  console.log('📁 File:', req.file);
+
+  try {
+    const { Room_name, price_per_day, status, description } = req.body;
+
+    if (!Room_name || !price_per_day) {
+      return res.status(400).json({ 
+        message: "Room name and price are required"
+      });
+    }
+
+    let image_url = null;
+    if (req.file) {
+      image_url = `/uploads/rooms/${req.file.filename}`;
+      console.log('🖼️ Image URL:', image_url);
+    }
+
+    // ตรวจสอบ room name ซ้ำ
     const [existingRoom] = await pool.query(
       "SELECT Room_name FROM room WHERE Room_name = ?",
       [Room_name]
     );
+
     if (existingRoom.length > 0) {
       return res.status(400).json({ message: "Room name already exists" });
     }
+
+    // ⭐️ แก้ไข: ใช้ SQL แบบไม่มี description ชั่วคราว
     const [result] = await pool.query(
       "INSERT INTO room (Room_name, image_url, price_per_day, status) VALUES (?, ?, ?, ?)",
       [Room_name, image_url, price_per_day, status || 'available']
     );
+
+    console.log('✅ Room inserted successfully, ID:', result.insertId);
+
     res.status(201).json({ 
       message: "Room added successfully", 
-      room_id: result.insertId 
+      room_id: result.insertId,
+      image_url: image_url
     });
+
   } catch (error) {
-    console.error("Error adding room:", error);
-    res.status(500).json({ message: "Internal Server Error" });
-  }
-});
-
-app.post("/staff/edit_room", async (req, res) => {
-  const { Room_id, Room_name, image_url, price_per_day, status } = req.body;
-  
-  try {
-  
-    if (!Room_id) {
-      return res.status(400).json({ message: "Room ID is required" });
-    }
-
+    console.error("❌ Error adding room:", error);
     
-    const [existingRoom] = await pool.query(
-      "SELECT Room_id FROM room WHERE Room_id = ?",
-      [Room_id]
-    );
-
-    if (existingRoom.length === 0) {
-      return res.status(404).json({ message: "Room not found" });
-    }
-
-   
-    if (Room_name) {
-      const [duplicateRoom] = await pool.query(
-        "SELECT Room_id FROM room WHERE Room_name = ? AND Room_id != ?",
-        [Room_name, Room_id]
-      );
-
-      if (duplicateRoom.length > 0) {
-        return res.status(400).json({ message: "Room name already exists" });
+    // ⭐️ แก้ไข: ตรวจสอบว่า fs ถูก define ก่อนใช้
+    if (req.file && typeof fs !== 'undefined') {
+      try {
+        fs.unlinkSync(req.file.path);
+        console.log('🗑️ Deleted uploaded file due to error');
+      } catch (fileError) {
+        console.error('Error deleting file:', fileError);
       }
-    }
-
-   
-    let updateFields = [];
-    let updateValues = [];
-
-    if (Room_name) {
-      updateFields.push("Room_name = ?");
-      updateValues.push(Room_name);
-    }
-    if (image_url) {
-      updateFields.push("image_url = ?");
-      updateValues.push(image_url);
-    }
-    if (price_per_day) {
-      updateFields.push("price_per_day = ?");
-      updateValues.push(price_per_day);
-    }
-    if (status) {
-      updateFields.push("status = ?");
-      updateValues.push(status);
-    }
-
-   
-    if (updateFields.length > 0) {
-      updateValues.push(Room_id); 
-
-      await pool.query(
-        `UPDATE room SET ${updateFields.join(", ")} WHERE Room_id = ?`,
-        updateValues
-      );
-
-      res.status(200).json({ 
-        message: "Room updated successfully" 
-      });
-    } else {
-      res.status(400).json({ 
-        message: "No fields to update" 
-      });
+    } else if (req.file) {
+      console.log('⚠️ File uploaded but fs module not available to delete');
     }
     
-  } catch (error) {
-    console.error("Error updating room:", error);
-    res.status(500).json({ message: "Internal Server Error" });
+    res.status(500).json({ 
+      message: "Internal Server Error",
+      error: error.message 
+    });
   }
 });
+
 app.get("/staff/history", async (req, res) => {
   try {
     // ดึงประวัติทั้งหมดจากตาราง history
@@ -795,6 +982,7 @@ app.get("/staff/dashboard", async (req, res) => {
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
 // =========================
 // ✅ API ดึงประวัติ (History) - (สำหรับ Lecturer/Admin)
 // =========================
@@ -871,6 +1059,8 @@ app.get("/get_user", async (req, res) => {
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
+
+
 // GET /staff/rooms
 app.get("/staff/rooms", async (req, res) => {
   try {
@@ -906,10 +1096,164 @@ app.get("/staff/rooms", async (req, res) => {
     });
   }
 });
+app.post("/staff/edit_room", async (req, res) => {
+  const { Room_id, Room_name, image_url, price_per_day, status, description } = req.body;
 
-// =========================
-// ✅ Start Server
-// =========================
+  try {
+    if (!Room_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Room ID is required",
+      });
+    }
+
+    // Check if room exists
+    const [existingRoom] = await pool.query(
+      "SELECT Room_id FROM room WHERE Room_id = ?",
+      [Room_id]
+    );
+
+    if (existingRoom.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Room not found",
+      });
+    }
+
+    // Validate Room_name
+    if (Room_name && Room_name.trim() !== "") {
+      if (Room_name.length > 255) {
+        return res.status(400).json({
+          success: false,
+          message: "Room name must not exceed 255 characters",
+        });
+      }
+
+      const [duplicateRoom] = await pool.query(
+        "SELECT Room_id FROM room WHERE Room_name = ? AND Room_id != ?",
+        [Room_name.trim(), Room_id]
+      );
+
+      if (duplicateRoom.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Room name already exists",
+        });
+      }
+    }
+
+    // Validate Status
+    const validStatuses = ["Free", "Approved", "Rejected", "Disabled"];
+    if (status !== undefined && !validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid status value",
+      });
+    }
+
+    // Validate Price
+    if (price_per_day !== undefined && price_per_day !== null) {
+      if (isNaN(price_per_day) || price_per_day < 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Price must be a positive number",
+        });
+      }
+    }
+
+    // Validate Image URL
+    if (image_url && image_url.trim() !== "") {
+      if (
+        !image_url.match(/^https?:\/\/.+\..+/) &&
+        !image_url.startsWith("/") &&
+        !image_url.startsWith("data:image/")
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid image URL format",
+        });
+      }
+    }
+
+    // Build update query
+    const updateFields = [];
+    const updateValues = [];
+
+    if (Room_name && Room_name.trim() !== "") {
+      updateFields.push("Room_name = ?");
+      updateValues.push(Room_name.trim());
+    }
+
+    if (image_url !== undefined) {
+      if (!image_url || image_url.trim() === "") {
+        updateFields.push("image_url = NULL");
+      } else {
+        updateFields.push("image_url = ?");
+        updateValues.push(image_url.trim());
+      }
+    }
+
+    if (price_per_day !== undefined && price_per_day !== null) {
+      updateFields.push("price_per_day = ?");
+      updateValues.push(parseFloat(price_per_day));
+    }
+
+    if (status !== undefined) {
+      updateFields.push("status = ?");
+      updateValues.push(status);
+    }
+
+    if (description !== undefined) {
+      if (!description || description === "") {
+        updateFields.push("description = NULL");
+      } else {
+        updateFields.push("description = ?");
+        updateValues.push(description);
+      }
+    }
+
+  
+
+    // Perform update
+    updateValues.push(Room_id);
+
+    const updateQuery = `
+      UPDATE room
+      SET ${updateFields.join(", ")}
+      WHERE Room_id = ?
+    `;
+
+    const [result] = await pool.query(updateQuery, updateValues);
+
+    if (result.affectedRows === 0) {
+      return res.status(500).json({
+        success: false,
+        message: "Failed to update room",
+      });
+    }
+
+    // Return updated data
+    const [updatedRoom] = await pool.query(
+      "SELECT * FROM room WHERE Room_id = ?",
+      [Room_id]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Room updated successfully",
+      room: updatedRoom[0],
+    });
+  } catch (error) {
+    console.error("Error updating room:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Internal Server Error",
+    });
+  }
+});
+
+// เริ่มต้นเซิร์ฟเวอร์
 app.listen(port, "0.0.0.0", () => {
   console.log(`Express server running at http://localhost:${port}`);
 });
